@@ -1,12 +1,19 @@
 // /api/arrivals.js
-// Soporta dos formatos del upstream:
-//  A) services[].arrivals[] con {minutes|min|eta}
-//  B) buses[] con {min_arrival_time|max_arrival_time} (el que estás viendo)
+// Soporta 3 variantes del upstream:
+//  A) services[].buses[] -> { min_arrival_time, max_arrival_time, ... }  ← TU CASO
+//  B) services[].arrivals[] -> { minutes|min|eta }
+//  C) buses[] a nivel raíz  -> { min_arrival_time|max_arrival_time }
+
+const norm = (s) => String(s || "").toUpperCase().replace(/\s|-/g, "");
+const addIfNum = (arr, v) => {
+  const n = Number(v);
+  if (Number.isFinite(n)) arr.push(n);
+};
 
 export default async function handler(req, res) {
   try {
-    const stop = String(req.query.stop || "PH645").toUpperCase();
-    const service = String(req.query.service || "H09").toUpperCase().replace(/\s|-/g, "");
+    const stop = norm(req.query.stop || "PH645");
+    const target = norm(req.query.service || "H09");
 
     const r = await fetch(
       `https://api.xor.cl/red/bus-stop/${encodeURIComponent(stop)}`,
@@ -15,41 +22,51 @@ export default async function handler(req, res) {
     if (!r.ok) return res.status(502).json({ error: `Upstream ${r.status}` });
     const data = await r.json();
 
-    const arrivals = [];
+    const minutes = [];
 
-    // --- Formato A: services[].arrivals[] ---
+    // ---- A) services[].buses[]  (TU JSON)
     const services = Array.isArray(data?.services) ? data.services : [];
     for (const s of services) {
-      const sid = String(s?.id || s?.name || "").toUpperCase().replace(/\s|-/g, "");
-      if (!sid.includes(service)) continue;
-      const arr = Array.isArray(s?.arrivals) ? s.arrivals : [];
-      for (const a of arr) {
-        const m = [a?.minutes, a?.min, a?.eta]
-          .map(Number).find(n => Number.isFinite(n));
-        if (Number.isFinite(m)) arrivals.push({ minutes: m });
-      }
-    }
+      const sid = norm(s?.id || s?.name);
+      if (!sid.includes(target)) continue;
 
-    // --- Formato B: top-level buses[] con min/max ---
-    // Úsalo si encontramos el servicio pedido en data.services
-    // (da igual si hay 1 o más; en tu paradero es H09).
-    if (arrivals.length === 0) {
-      const hasTarget = services.some(s =>
-        String(s?.id || s?.name || "").toUpperCase().replace(/\s|-/g, "").includes(service)
-      );
-      if (hasTarget) {
-        const buses = Array.isArray(data?.buses) ? data.buses : [];
-        for (const b of buses) {
-          const min = Number(b?.min_arrival_time);
-          const max = Number(b?.max_arrival_time);
-          if (Number.isFinite(min)) arrivals.push({ minutes: min });
-          if (Number.isFinite(max) && max !== min) arrivals.push({ minutes: max });
+      // A1: buses[]
+      if (Array.isArray(s?.buses)) {
+        for (const b of s.buses) {
+          addIfNum(minutes, b?.min_arrival_time);
+          addIfNum(minutes, b?.max_arrival_time);
+          addIfNum(minutes, b?.minutes);
+          addIfNum(minutes, b?.eta);
+          addIfNum(minutes, b?.min);
+        }
+      }
+
+      // B) arrivals[]
+      if (Array.isArray(s?.arrivals)) {
+        for (const a of s.arrivals) {
+          addIfNum(minutes, a?.minutes);
+          addIfNum(minutes, a?.min);
+          addIfNum(minutes, a?.eta);
+          addIfNum(minutes, a?.min_arrival_time);
+          addIfNum(minutes, a?.max_arrival_time);
         }
       }
     }
 
-    arrivals.sort((a, b) => a.minutes - b.minutes);
-    return res.status(200).json({ arrivals });
+    // C) buses[] a nivel raíz (solo si aún no obtuvimos nada)
+    if (!minutes.length && Array.isArray(data?.buses)) {
+      for (const b of data.buses) {
+        addIfNum(minutes, b?.min_arrival_time);
+        addIfNum(minutes, b?.max_arrival_time);
+        addIfNum(minutes, b?.minutes);
+        addIfNum(minutes, b?.eta);
+        addIfNum(minutes, b?.min);
+      }
+    }
+
+    // Normaliza, deduplica y ordena
+    const uniqSorted = [...new Set(minutes)].sort((a, b) => a - b);
+    return res.status(200).json({ arrivals: uniqSorted.map(m => ({ minutes: m })) });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
