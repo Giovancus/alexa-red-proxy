@@ -1,14 +1,8 @@
 // /api/arrivals.js
-// Soporta 3 variantes del upstream:
-//  A) services[].buses[] -> { min_arrival_time, max_arrival_time, ... }  ← TU CASO
-//  B) services[].arrivals[] -> { minutes|min|eta }
-//  C) buses[] a nivel raíz  -> { min_arrival_time|max_arrival_time }
+// Devuelve llegadas como objetos con rango cuando el upstream trae min/max,
+// y como "minutes" cuando solo hay un valor. Ordena por el valor mínimo.
 
 const norm = (s) => String(s || "").toUpperCase().replace(/\s|-/g, "");
-const addIfNum = (arr, v) => {
-  const n = Number(v);
-  if (Number.isFinite(n)) arr.push(n);
-};
 
 export default async function handler(req, res) {
   try {
@@ -22,51 +16,42 @@ export default async function handler(req, res) {
     if (!r.ok) return res.status(502).json({ error: `Upstream ${r.status}` });
     const data = await r.json();
 
-    const minutes = [];
+    const out = [];
+    const addRange = (min, max) => {
+      const a = Number(min), b = Number(max);
+      if (Number.isFinite(a) && Number.isFinite(b)) out.push({ min: a, max: b });
+      else if (Number.isFinite(a)) out.push({ minutes: a });
+      else if (Number.isFinite(b)) out.push({ minutes: b });
+    };
+    const addSingle = (m) => {
+      const n = Number(m);
+      if (Number.isFinite(n)) out.push({ minutes: n });
+    };
 
-    // ---- A) services[].buses[]  (TU JSON)
     const services = Array.isArray(data?.services) ? data.services : [];
+
+    // A) services[].buses[] con min/max  ← tu caso
     for (const s of services) {
       const sid = norm(s?.id || s?.name);
       if (!sid.includes(target)) continue;
-
-      // A1: buses[]
       if (Array.isArray(s?.buses)) {
-        for (const b of s.buses) {
-          addIfNum(minutes, b?.min_arrival_time);
-          addIfNum(minutes, b?.max_arrival_time);
-          addIfNum(minutes, b?.minutes);
-          addIfNum(minutes, b?.eta);
-          addIfNum(minutes, b?.min);
-        }
+        for (const b of s.buses) addRange(b?.min_arrival_time, b?.max_arrival_time);
       }
-
-      // B) arrivals[]
+      // B) services[].arrivals[] con minutes/min/eta
       if (Array.isArray(s?.arrivals)) {
-        for (const a of s.arrivals) {
-          addIfNum(minutes, a?.minutes);
-          addIfNum(minutes, a?.min);
-          addIfNum(minutes, a?.eta);
-          addIfNum(minutes, a?.min_arrival_time);
-          addIfNum(minutes, a?.max_arrival_time);
-        }
+        for (const a of s.arrivals) addSingle(a?.minutes ?? a?.min ?? a?.eta);
       }
     }
 
-    // C) buses[] a nivel raíz (solo si aún no obtuvimos nada)
-    if (!minutes.length && Array.isArray(data?.buses)) {
-      for (const b of data.buses) {
-        addIfNum(minutes, b?.min_arrival_time);
-        addIfNum(minutes, b?.max_arrival_time);
-        addIfNum(minutes, b?.minutes);
-        addIfNum(minutes, b?.eta);
-        addIfNum(minutes, b?.min);
-      }
+    // C) buses[] a nivel raíz si no salió nada arriba
+    if (!out.length && Array.isArray(data?.buses)) {
+      for (const b of data.buses) addRange(b?.min_arrival_time, b?.max_arrival_time);
     }
 
-    // Normaliza, deduplica y ordena
-    const uniqSorted = [...new Set(minutes)].sort((a, b) => a - b);
-    return res.status(200).json({ arrivals: uniqSorted.map(m => ({ minutes: m })) });
+    // Orden por mínimo conocido
+    out.sort((x, y) => (x.minutes ?? x.min ?? 9e9) - (y.minutes ?? y.min ?? 9e9));
+
+    return res.status(200).json({ arrivals: out });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
