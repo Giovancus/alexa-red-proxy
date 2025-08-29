@@ -30,7 +30,7 @@ export default async function handler(req, res) {
     const forceGoogle = String(req.query.force_google || req.query.fg || "") === "1";
 
     // preparar promesas
-    const allowGoogle = stop === "PH645" && target === "H09" && hasGoogleCfg();
+    const allowGoogle = stop === "PH1474" && target === "H09" && hasGoogleCfg();
 
     const pXor = forceGoogle
       ? Promise.resolve({ arrivals: [], source: "xor" })
