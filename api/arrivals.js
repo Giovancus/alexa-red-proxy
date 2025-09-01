@@ -1,12 +1,7 @@
 // /api/arrivals.js
-// Mejora: race XOR vs Google, cache 15s, y campo "source" en la respuesta.
-//
-// Env vars en Vercel (Settings → Environment Variables):
-// GMAPS_API_KEY, PH645_LAT, PH645_LNG, DEST_PLACE_ID_H09
-//
-// Prueba en navegador:
-//  - Normal: https://<tu>.vercel.app/api/arrivals?stop=PH645&service=H09
-//  - Forzar Google: ...&force_google=1
+// - PREFIERE XOR (tiempo real) con una "ventana de gracia" sobre Google.
+// - Cache CDN reducido a 5s.
+// - Respuesta con {arrivals:[{minutes}|{min,max}], source:'xor'|'google'}.
 
 const norm = (s) => String(s || "").toUpperCase().replace(/\s|-/g, "");
 
@@ -15,37 +10,43 @@ const PH645_LAT = Number(process.env.PH645_LAT);
 const PH645_LNG = Number(process.env.PH645_LNG);
 const DEST_PLACE_ID_H09 = process.env.DEST_PLACE_ID_H09 || "";
 
-const hasGoogleCfg = () =>
+// Cambia aquí si usas otro paradero / servicio para permitir Google
+const ALLOW_GOOGLE_FOR = (stop, target) =>
+  stop === "PH1474" && target === "H09" &&
   Boolean(GMAPS_KEY && Number.isFinite(PH645_LAT) && Number.isFinite(PH645_LNG) && DEST_PLACE_ID_H09);
 
 export default async function handler(req, res) {
   try {
-    // cache CDN 15s + stale-while-revalidate
-    res.setHeader("Cache-Control", "s-maxage=15, stale-while-revalidate=30");
-    res.setHeader("CDN-Cache-Control", "s-maxage=15, stale-while-revalidate=30");
-    res.setHeader("Vercel-CDN-Cache-Control", "s-maxage=15, stale-while-revalidate=30");
+    // caché corta (5s) para evitar repetir valores
+    setCache(res, 5, 10);
 
-    const stop = norm(req.query.stop || "PH645");
+    const stop = norm(req.query.stop || "PH1474"); // ← default actualizado
     const target = norm(req.query.service || "H09");
     const forceGoogle = String(req.query.force_google || req.query.fg || "") === "1";
+    const allowGoogle = ALLOW_GOOGLE_FOR(stop, target);
 
-    // preparar promesas
-    const allowGoogle = stop === "PH1474" && target === "H09" && hasGoogleCfg();
+    const pXor = forceGoogle ? Promise.resolve({ arrivals: [], source: "xor" }) : getFromXor(stop, target);
+    const pGoogle = allowGoogle ? getFromGoogle({ lat: PH645_LAT, lng: PH645_LNG }, DEST_PLACE_ID_H09, target, GMAPS_KEY)
+                                : Promise.resolve({ arrivals: [], source: "google" });
 
-    const pXor = forceGoogle
-      ? Promise.resolve({ arrivals: [], source: "xor" })
-      : getFromXor(stop, target);
+    // Prefiere XOR: si Google llega primero, espera "graceMs" por XOR antes de decidir.
+    const winner = await preferXor(pXor, pGoogle, { graceMs: 1200, timeoutMs: 6500 });
 
-    const pGoogle = allowGoogle
-      ? getFromGoogle({ lat: PH645_LAT, lng: PH645_LNG }, DEST_PLACE_ID_H09, target, GMAPS_KEY)
-      : Promise.resolve({ arrivals: [], source: "google" });
+    // Si finalmente vienen de Google, aún más prudente con el caché
+    if (winner?.source === "google") setCache(res, 3, 6);
 
-    // devolver la PRIMERA que traiga datos
-    const winner = await firstWithData([pXor, pGoogle], 6500);
+    res.setHeader("X-Data-Source", winner?.source || "none");
     return res.status(200).json(winner || { arrivals: [], source: "none" });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
+}
+
+function setCache(res, smax, swr) {
+  const v = `s-maxage=${smax}, stale-while-revalidate=${swr}`;
+  res.setHeader("Cache-Control", v);
+  res.setHeader("CDN-Cache-Control", v);
+  res.setHeader("Vercel-CDN-Cache-Control", v);
 }
 
 function addIfNum(arr, v) { const n = Number(v); if (Number.isFinite(n)) arr.push(n); }
@@ -81,8 +82,8 @@ async function getFromXor(stop, target) {
     }
 
     const uniq = [...new Set(minutes)].sort((a, b) => a - b);
-    // Empaquetar en rangos si parecen pares (min,max) del mismo bus
     const out = [];
+    // Empaquetar en rangos si parecen pares (min,max) del mismo bus
     for (let i = 0; i < uniq.length; i += 2) {
       const a = uniq[i], b = uniq[i + 1];
       if (Number.isFinite(a) && Number.isFinite(b) && b >= a && b - a <= 6) out.push({ min: a, max: b });
@@ -125,16 +126,16 @@ async function getFromGoogle(originLatLng, destPlaceId, target, apiKey) {
           if (step.travel_mode !== "TRANSIT") continue;
           const td = step.transit_details || {};
           const line = td.line || {};
-          const shortName =
-            (line.short_name || line.name_short || line.name || "").toString().toUpperCase().replace(/\s|-/g, "");
+          const shortName = (line.short_name || line.name_short || line.name || "")
+            .toString().toUpperCase().replace(/\s|-/g, "");
           if (shortName !== target) continue;
 
           const dep = td.departure_time;
           const depSec = typeof dep?.value === "number" ? dep.value : Number(dep);
           if (!Number.isFinite(depSec)) continue;
 
-          const minutes = Math.max(0, Math.round((depSec - now) / 60));
-          if (best === null || minutes < best) best = minutes;
+          const m = Math.max(0, Math.round((depSec - now) / 60));
+          if (best === null || m < best) best = m;
         }
       }
     }
@@ -144,22 +145,31 @@ async function getFromGoogle(originLatLng, destPlaceId, target, apiKey) {
   }
 }
 
-// Espera la primera promesa que devuelva arrivals NO vacíos (o entrega la mejor disponible tras timeout)
-async function firstWithData(promises, timeoutMs) {
+// Prefiere XOR: si Google llega primero, espera 'graceMs' para ver si aparece XOR con datos.
+async function preferXor(pXor, pGoogle, { graceMs = 1200, timeoutMs = 6500 } = {}) {
   return new Promise((resolve) => {
-    let resolved = false, settled = 0, last = null;
-    const tryResolve = (res) => {
-      last = res;
-      if (!resolved && res && Array.isArray(res.arrivals) && res.arrivals.length) {
-        resolved = true; resolve(res);
+    let resolved = false, xorRes, googleRes;
+    const done = (v) => { if (!resolved) { resolved = true; resolve(v); } };
+
+    pXor.then(r => { xorRes = r; if (r.arrivals?.length) done(r); })
+        .catch(()=>{});
+
+    pGoogle.then(r => {
+      googleRes = r;
+      if (xorRes?.arrivals?.length) return done(xorRes);
+      // Google llegó primero: esperamos una ventana corta por XOR
+      setTimeout(() => {
+        if (xorRes?.arrivals?.length) done(xorRes);
+        else if (r.arrivals?.length) done(r);
+      }, graceMs);
+    }).catch(()=>{});
+
+    setTimeout(() => {
+      if (!resolved) {
+        if (xorRes?.arrivals?.length) done(xorRes);
+        else if (googleRes?.arrivals?.length) done(googleRes);
+        else done(xorRes || googleRes || { arrivals: [], source: "none" });
       }
-    };
-    for (const p of promises) {
-      p.then(tryResolve).catch(()=>{}).finally(() => {
-        settled++;
-        if (settled === promises.length && !resolved) resolve(last || { arrivals: [], source: "none" });
-      });
-    }
-    setTimeout(() => { if (!resolved) resolve(last || { arrivals: [], source: "none" }); }, timeoutMs);
+    }, timeoutMs);
   });
 }
