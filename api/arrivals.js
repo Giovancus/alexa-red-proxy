@@ -1,38 +1,44 @@
 // /api/arrivals.js
 // - PREFIERE XOR (tiempo real) con una "ventana de gracia" sobre Google.
-// - Cache CDN reducido a 5s.
-// - Respuesta con {arrivals:[{minutes}|{min,max}], source:'xor'|'google'}.
+// - Cache CDN reducido a 5s (evita repetir valores).
+// - Respuesta: { arrivals:[{minutes}|{min,max}], source:'xor'|'google' }.
+// - Paradero por defecto: PH1474, Servicio: H09.
+//
+// Env vars en Vercel (Settings → Environment Variables):
+//   GMAPS_API_KEY, PH645_LAT, PH645_LNG, DEST_PLACE_ID_H09
+//   *Reutilizamos PH645_LAT/LNG con las coordenadas de PH1474, como acordamos.*
 
 const norm = (s) => String(s || "").toUpperCase().replace(/\s|-/g, "");
 
 const GMAPS_KEY = process.env.GMAPS_API_KEY || "";
-const PH645_LAT = Number(process.env.PH645_LAT);
-const PH645_LNG = Number(process.env.PH645_LNG);
+const PH645_LAT = Number(process.env.PH645_LAT); // ahora contiene LAT de PH1474
+const PH645_LNG = Number(process.env.PH645_LNG); // ahora contiene LNG de PH1474
 const DEST_PLACE_ID_H09 = process.env.DEST_PLACE_ID_H09 || "";
 
-// Cambia aquí si usas otro paradero / servicio para permitir Google
+// Permite Google si es el paradero/servicio configurado y hay creds
 const ALLOW_GOOGLE_FOR = (stop, target) =>
   stop === "PH1474" && target === "H09" &&
   Boolean(GMAPS_KEY && Number.isFinite(PH645_LAT) && Number.isFinite(PH645_LNG) && DEST_PLACE_ID_H09);
 
 export default async function handler(req, res) {
   try {
-    // caché corta (5s) para evitar repetir valores
+    // caché corta (5s) + stale
     setCache(res, 5, 10);
 
-    const stop = norm(req.query.stop || "PH1474"); // ← default actualizado
+    const stop = norm(req.query.stop || "PH1474"); // default actualizado
     const target = norm(req.query.service || "H09");
     const forceGoogle = String(req.query.force_google || req.query.fg || "") === "1";
     const allowGoogle = ALLOW_GOOGLE_FOR(stop, target);
 
     const pXor = forceGoogle ? Promise.resolve({ arrivals: [], source: "xor" }) : getFromXor(stop, target);
-    const pGoogle = allowGoogle ? getFromGoogle({ lat: PH645_LAT, lng: PH645_LNG }, DEST_PLACE_ID_H09, target, GMAPS_KEY)
-                                : Promise.resolve({ arrivals: [], source: "google" });
+    const pGoogle = allowGoogle
+      ? getFromGoogle({ lat: PH645_LAT, lng: PH645_LNG }, DEST_PLACE_ID_H09, target, GMAPS_KEY)
+      : Promise.resolve({ arrivals: [], source: "google" });
 
     // Prefiere XOR: si Google llega primero, espera "graceMs" por XOR antes de decidir.
     const winner = await preferXor(pXor, pGoogle, { graceMs: 1200, timeoutMs: 6500 });
 
-    // Si finalmente vienen de Google, aún más prudente con el caché
+    // Si ganó Google, aún más prudente con el caché
     if (winner?.source === "google") setCache(res, 3, 6);
 
     res.setHeader("X-Data-Source", winner?.source || "none");
